@@ -1,0 +1,174 @@
+{
+  "sshkeys.drift": {
+    "urgent": true,
+    "en": { "why": "A key added to authorized_keys grants permanent access and survives password changes.", "cmd": "grep -n . /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys" },
+    "fr": { "why": "Une clé ajoutée dans authorized_keys donne un accès permanent et survit à tout changement de mot de passe.", "cmd": "grep -n . /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys" }
+  },
+  "sshlogin.newip": {
+    "urgent": true,
+    "en": { "why": "Someone authenticated successfully from an address never seen before.", "cmd": "journalctl -u ssh --since -48h | grep -a Accepted; last -F -a | head -20" },
+    "fr": { "why": "Quelqu'un s'est authentifié avec succès depuis une adresse jamais vue.", "cmd": "journalctl -u ssh --since -48h | grep -a Accepted; last -F -a | head -20" }
+  },
+  "rootkit.preload": {
+    "urgent": true,
+    "en": { "why": "ld.so.preload injects a library into every process started on the host.", "cmd": "cat /etc/ld.so.preload; mv /etc/ld.so.preload /root/ld.so.preload.quarantine" },
+    "fr": { "why": "ld.so.preload injecte une bibliothèque dans tous les processus lancés sur la machine.", "cmd": "cat /etc/ld.so.preload; mv /etc/ld.so.preload /root/ld.so.preload.quarantine" }
+  },
+  "proc.suspect": {
+    "urgent": true,
+    "en": { "why": "Miner or reverse-shell pattern in the process table.", "cmd": "ps -eo pid,user,etime,cmd --sort=-etime | head -30; ls -l /proc/<PID>/exe" },
+    "fr": { "why": "Motif de mineur ou de reverse shell dans la table des processus.", "cmd": "ps -eo pid,user,etime,cmd --sort=-etime | head -30; ls -l /proc/<PID>/exe" }
+  },
+  "webshell.suspect": {
+    "urgent": true,
+    "en": { "why": "A recently written PHP file calls eval or shell_exec under a document root.", "cmd": "grep -nE 'eval|base64_decode|shell_exec|passthru' <file>" },
+    "fr": { "why": "Un fichier PHP récent appelle eval ou shell_exec sous une racine web.", "cmd": "grep -nE 'eval|base64_decode|shell_exec|passthru' <fichier>" }
+  },
+  "http.leak": {
+    "urgent": true,
+    "en": { "why": "A sensitive path returned 200: content was served, not merely requested.", "cmd": "grep -a ' 200 ' /var/log/nginx/access.log | grep -aE '/\\.env|/\\.git/|/installer'" },
+    "fr": { "why": "Un chemin sensible a répondu 200 : du contenu a été servi, pas seulement demandé.", "cmd": "grep -a ' 200 ' /var/log/nginx/access.log | grep -aE '/\\.env|/\\.git/|/installer'" }
+  },
+  "url.exposed": {
+    "urgent": true,
+    "en": { "why": "An endpoint expected to be closed answers to the whole internet.", "cmd": "curl -I <url>" },
+    "fr": { "why": "Un point d'entrée censé être fermé répond à Internet entier.", "cmd": "curl -I <url>" }
+  },
+  "suid.drift": {
+    "urgent": true,
+    "en": { "why": "A new SUID binary is a standard privilege-escalation foothold.", "cmd": "find / -xdev -perm -4000 -type f -exec ls -la {} +" },
+    "fr": { "why": "Un binaire SUID nouveau est un point d'appui classique d'élévation de privilèges.", "cmd": "find / -xdev -perm -4000 -type f -exec ls -la {} +" }
+  },
+  "accounts.drift": {
+    "urgent": true,
+    "en": { "why": "A new UID 0 or passwordless account is a persistence mechanism.", "cmd": "awk -F: '$3==0' /etc/passwd; awk -F: '$2==\"\"' /etc/shadow" },
+    "fr": { "why": "Un compte UID 0 ou sans mot de passe est un mécanisme de persistance.", "cmd": "awk -F: '$3==0' /etc/passwd; awk -F: '$2==\"\"' /etc/shadow" }
+  },
+  "secret.worldread": {
+    "urgent": false,
+    "fix": "perm_env",
+    "en": { "why": "Any local account can read the credentials in that file.", "cmd": "chmod 640 <file>" },
+    "fr": { "why": "N'importe quel compte local peut lire les identifiants de ce fichier.", "cmd": "chmod 640 <fichier>" }
+  },
+  "db.rootremote": {
+    "urgent": false,
+    "en": { "why": "The database administrator account accepts connections from outside the host.", "cmd": "mysql -e \"SELECT User,Host FROM mysql.user WHERE User='root';\"" },
+    "fr": { "why": "Le compte administrateur de la base accepte des connexions hors de la machine.", "cmd": "mysql -e \"SELECT User,Host FROM mysql.user WHERE User='root';\"" }
+  },
+  "db.super": {
+    "urgent": false,
+    "en": { "why": "A wildcard-host account holds SUPER: one leaked password is full database control.", "cmd": "mysql -e \"SELECT User,Host FROM mysql.user WHERE Super_priv='Y';\"" },
+    "fr": { "why": "Un compte en hôte joker détient SUPER : un mot de passe fuité donne le contrôle total.", "cmd": "mysql -e \"SELECT User,Host FROM mysql.user WHERE Super_priv='Y';\"" }
+  },
+  "db.noblock": {
+    "urgent": false,
+    "fix": "db_block",
+    "en": { "why": "Nothing but the daemon's own bind address keeps the database off the internet.", "cmd": "hostwatch fix db_block" },
+    "fr": { "why": "Rien d'autre que l'adresse d'écoute du démon ne garde la base hors d'Internet.", "cmd": "hostwatch fix db_block" }
+  },
+  "ssl.expired": {
+    "urgent": false,
+    "fix": "certbot_renew",
+    "en": { "why": "Visitors get a browser interstitial; API clients fail outright.", "cmd": "certbot renew --force-renewal" },
+    "fr": { "why": "Les visiteurs voient un avertissement navigateur, les clients API échouent.", "cmd": "certbot renew --force-renewal" }
+  },
+  "ssl.soon": {
+    "urgent": false,
+    "fix": "certbot_renew",
+    "en": { "why": "Renewal has not happened yet and the window is closing.", "cmd": "certbot renew --dry-run" },
+    "fr": { "why": "Le renouvellement n'a pas eu lieu et la fenêtre se referme.", "cmd": "certbot renew --dry-run" }
+  },
+  "certbot.account": {
+    "urgent": false,
+    "en": { "why": "Renewal fails silently until the certificate expires. A deleted ACME account does exactly this.", "cmd": "certbot renew --dry-run 2>&1 | tail -20" },
+    "fr": { "why": "Le renouvellement échoue en silence jusqu'à l'expiration. Un compte ACME supprimé fait exactement ça.", "cmd": "certbot renew --dry-run 2>&1 | tail -20" }
+  },
+  "service.down": {
+    "urgent": false,
+    "en": { "why": "A stopped service is either a crash or someone stopping it.", "cmd": "systemctl status <service>; journalctl -u <service> -n 50" },
+    "fr": { "why": "Un service arrêté, c'est soit un plantage, soit quelqu'un qui l'a arrêté.", "cmd": "systemctl status <service>; journalctl -u <service> -n 50" }
+  },
+  "service.pm2": {
+    "urgent": false,
+    "en": { "why": "The process is down or crash-looping.", "cmd": "pm2 logs <app> --lines 80" },
+    "fr": { "why": "Le process est tombé ou boucle sur un crash.", "cmd": "pm2 logs <app> --lines 80" }
+  },
+  "ports.drift": {
+    "urgent": false,
+    "en": { "why": "A new public listener is either a deployment or something that installed itself.", "cmd": "ss -tlnp" },
+    "fr": { "why": "Un nouveau port public en écoute, c'est soit un déploiement, soit quelque chose qui s'est installé tout seul.", "cmd": "ss -tlnp" }
+  },
+  "config.drift": {
+    "urgent": false,
+    "en": { "why": "sshd, sudoers or nginx changed. Confirm it was you.", "cmd": "sshd -T | head -40; ls -la /etc/sudoers.d" },
+    "fr": { "why": "sshd, sudoers ou nginx ont changé. Confirmer que c'est bien vous.", "cmd": "sshd -T | head -40; ls -la /etc/sudoers.d" }
+  },
+  "fw.drift": {
+    "urgent": false,
+    "en": { "why": "A rule was added or removed. Removals open access.", "cmd": "iptables -S" },
+    "fr": { "why": "Une règle a été ajoutée ou retirée. Un retrait ouvre un accès.", "cmd": "iptables -S" }
+  },
+  "cron.drift": {
+    "urgent": false,
+    "en": { "why": "Scheduled jobs are the usual place to hide persistence.", "cmd": "crontab -l; ls -la /etc/cron.d; systemctl list-timers --all" },
+    "fr": { "why": "Les tâches planifiées sont l'endroit habituel où se cache la persistance.", "cmd": "crontab -l; ls -la /etc/cron.d; systemctl list-timers --all" }
+  },
+  "docker.drift": {
+    "urgent": false,
+    "en": { "why": "A container now publishes on every interface.", "cmd": "docker ps --format '{{.Names}}\\t{{.Ports}}'" },
+    "fr": { "why": "Un conteneur publie désormais sur toutes les interfaces.", "cmd": "docker ps --format '{{.Names}}\\t{{.Ports}}'" }
+  },
+  "disk.full": {
+    "urgent": false,
+    "en": { "why": "At 100% the database stops accepting writes and logs stop.", "cmd": "du -xh / --max-depth=2 2>/dev/null | sort -h | tail -20" },
+    "fr": { "why": "À 100% la base refuse les écritures et les logs s'arrêtent.", "cmd": "du -xh / --max-depth=2 2>/dev/null | sort -h | tail -20" }
+  },
+  "disk.high": {
+    "urgent": false,
+    "en": { "why": "Headroom is shrinking; backups and package upgrades need room.", "cmd": "du -xh / --max-depth=2 2>/dev/null | sort -h | tail -20" },
+    "fr": { "why": "La marge se réduit ; sauvegardes et mises à jour ont besoin de place.", "cmd": "du -xh / --max-depth=2 2>/dev/null | sort -h | tail -20" }
+  },
+  "disk.inodes": {
+    "urgent": false,
+    "en": { "why": "Inode exhaustion fails writes while df still shows free space.", "cmd": "for d in /var /home /tmp; do echo -n \"$d \"; find $d -xdev | wc -l; done" },
+    "fr": { "why": "L'épuisement des inodes fait échouer les écritures alors que df montre de la place libre.", "cmd": "for d in /var /home /tmp; do echo -n \"$d \"; find $d -xdev | wc -l; done" }
+  },
+  "apt.security": {
+    "urgent": false,
+    "fix": "apt_security_safe",
+    "en": { "why": "Published CVEs with public exploit code, already packaged.", "cmd": "hostwatch fix apt_security_safe" },
+    "fr": { "why": "Des CVE publiées avec du code d'exploitation public, déjà empaquetées.", "cmd": "hostwatch fix apt_security_safe" }
+  },
+  "kernel.reboot": {
+    "urgent": false,
+    "en": { "why": "Patched kernel and libraries only take effect after a restart.", "cmd": "cat /var/run/reboot-required.pkgs" },
+    "fr": { "why": "Noyau et bibliothèques patchés ne prennent effet qu'après redémarrage.", "cmd": "cat /var/run/reboot-required.pkgs" }
+  },
+  "webroot.sensitive": {
+    "urgent": false,
+    "en": { "why": "Archives, dumps and .git under a document root are downloadable.", "cmd": "find <webroot> -maxdepth 3 \\( -name '.env' -o -name '.git' -o -iname '*.sql*' -o -iname '*.zip' \\)" },
+    "fr": { "why": "Archives, dumps et .git sous une racine web sont téléchargeables.", "cmd": "find <webroot> -maxdepth 3 \\( -name '.env' -o -name '.git' -o -iname '*.sql*' -o -iname '*.zip' \\)" }
+  },
+  "http.scan": {
+    "urgent": false,
+    "noise": true,
+    "en": { "why": "Automated scanning is constant background traffic on any public address.", "cmd": "" },
+    "fr": { "why": "Le scan automatisé est du bruit de fond permanent sur toute adresse publique.", "cmd": "" }
+  },
+  "f2b.spike": {
+    "urgent": false,
+    "noise": true,
+    "en": { "why": "A ban spike means fail2ban is working, not that anyone got in.", "cmd": "fail2ban-client status sshd" },
+    "fr": { "why": "Un pic de bannissements signifie que fail2ban fait son travail, pas que quelqu'un est entré.", "cmd": "fail2ban-client status sshd" }
+  },
+  "ssl.unreadable": {
+    "urgent": false,
+    "en": { "why": "The certificate could not be parsed; renewal state is unknown.", "cmd": "openssl x509 -noout -text -in <cert>" },
+    "fr": { "why": "Le certificat n'a pas pu être lu ; l'état du renouvellement est inconnu.", "cmd": "openssl x509 -noout -text -in <cert>" }
+  },
+  "site.down": {
+    "urgent": false,
+    "en": { "why": "The site did not answer 2xx or 3xx from this host.", "cmd": "curl -sSI <url>; systemctl status nginx" },
+    "fr": { "why": "Le site n'a pas répondu 2xx ou 3xx depuis cette machine.", "cmd": "curl -sSI <url>; systemctl status nginx" }
+  }
+}

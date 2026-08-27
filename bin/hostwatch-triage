@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# hostwatch-triage — rule engine that turns a raw scan into a verdict.
+#
+#   hostwatch-triage [scan.json]   -> analysis JSON on stdout
+#
+# Separates background noise from signal without calling anything external.
+# Local and deterministic: no network call, no external service.
+#
+# Contract:
+#   { verdict: ok|watch|action|urgent, summary, analysis,
+#     priorities: [{title, why, command}], noise: [], source }
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C.UTF-8
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${HW_LIB:=/var/lib/hostwatch}"
+: "${HW_LANG:=en}"
+
+SHARE=${HW_SHARE:-$(cd "$(dirname "$(readlink -f "$0")")/../share" 2>/dev/null && pwd)}
+RULES=${HW_RULES:-$SHARE/rules.json}
+SCAN=${1:-$HW_LIB/scans/last.json}
+
+[ -s "$SCAN" ] || { printf '%s\n' '{"verdict":"watch","summary":"No scan available.","analysis":"","priorities":[],"noise":[],"source":"triage"}'; exit 0; }
+[ -s "$RULES" ] || RULES=/dev/null
+
+# Counts of the previous cycles, for trend.
+PREV=$(ls -1t "$HW_LIB/reports"/*.json 2>/dev/null | head -4 | tail -3 \
+  | xargs -r jq -c '{ts:(.scan.ts//.ts),crit:(.scan.counts.crit//0),warn:(.scan.counts.warn//0)}' 2>/dev/null \
+  | jq -sc . 2>/dev/null)
+[ -z "$PREV" ] && PREV='[]'
+
+jq -c \
+  --slurpfile rules "$RULES" \
+  --argjson prev "$PREV" \
+  --arg lang "$HW_LANG" '
+  ($rules[0] // {})                                    as $R |
+  (if $lang == "fr" then "fr" else "en" end)           as $L |
+
+  # Removal findings carry a .rm suffix and share the rule of their base code.
+  def rule($code): ($R[($code | sub("\\.rm$";""))] // {});
+  def txt($code; $k): (rule($code) | .[$L] // .en // {} | .[$k] // "");
+
+  [ .findings[]? | select(.code | startswith("baseline.") | not) ]  as $real |
+  [ $real[] | select(.level == "crit") ]                            as $crit |
+  [ $real[] | select(.level == "warn") ]                            as $warn |
+  [ $crit[] | select(rule(.code).urgent == true) ]                  as $urgent |
+  [ $real[] | select(rule(.code).noise == true) ]                   as $noise |
+
+  (if   ($urgent | length) > 0 then "urgent"
+   elif ($crit   | length) > 0 then "action"
+   elif ($warn   | length) > 0 then "watch"
+   else "ok" end)                                                   as $verdict |
+
+  # Ordering: confirmed compromise first, then everything else critical, then
+  # warnings that have a known remediation. unique_by sorts, which would bury a
+  # critical finding under an alphabetically earlier warning, so dedupe by hand.
+  ([ $urgent[],
+     ($crit[] | select(rule(.code).urgent != true)),
+     ($warn[] | select(rule(.code).noise != true and txt(.code; "cmd") != ""))
+   ]
+   | reduce .[] as $f ([]; if any(.[]; .code == $f.code) then . else . + [$f] end)
+   | .[0:5])                                                        as $prio |
+
+  ($prev | map(.crit) | add // 0)                                   as $prevcrit |
+
+  { verdict: $verdict,
+
+    summary:
+      (if $lang == "fr" then
+         (if   $verdict == "urgent" then "\($urgent|length) constat(s) de compromission probable, \($crit|length) critique(s) au total."
+          elif $verdict == "action" then "\($crit|length) point(s) critique(s) à corriger, \($warn|length) avertissement(s)."
+          elif $verdict == "watch"  then "\($warn|length) avertissement(s), rien de critique."
+          else "Aucune anomalie sur ce cycle." end)
+       else
+         (if   $verdict == "urgent" then "\($urgent|length) probable-compromise finding(s), \($crit|length) critical in total."
+          elif $verdict == "action" then "\($crit|length) critical item(s) to fix, \($warn|length) warning(s)."
+          elif $verdict == "watch"  then "\($warn|length) warning(s), nothing critical."
+          else "Nothing anomalous this cycle." end)
+       end),
+
+    analysis:
+      ([ (if $lang == "fr" then
+            "Scan \(.mode) en \(.duration_s) s : \(.counts.crit) critique(s), \(.counts.warn) avertissement(s), \(.counts.info) information(s)."
+          else
+            "\(.mode) scan in \(.duration_s)s: \(.counts.crit) critical, \(.counts.warn) warnings, \(.counts.info) info."
+          end),
+          (if ($prev | length) > 0 then
+             (if $lang == "fr" then "Cycles précédents : \($prevcrit) critique(s) cumulé(s) sur \($prev|length) passage(s)."
+              else "Previous cycles: \($prevcrit) critical across \($prev|length) run(s)." end)
+           else empty end),
+          (if (.metrics.ssh_failed_24h // 0) > 0 then
+             (if $lang == "fr" then "SSH 24 h : \(.metrics.ssh_failed_24h) échec(s)\(if (.metrics.ssh_new_ips // "") != "" then ", IP réussie inconnue détectée" else ", aucune IP réussie inconnue" end)."
+              else "SSH 24h: \(.metrics.ssh_failed_24h) failures\(if (.metrics.ssh_new_ips // "") != "" then ", unknown successful source IP present" else ", no unknown successful source" end)." end)
+           else empty end),
+          (if ($noise | length) > 0 then
+             (if $lang == "fr" then "\($noise|length) constat(s) classé(s) en bruit de fond."
+              else "\($noise|length) finding(s) classified as background noise." end)
+           else empty end)
+        ] | join(" ")),
+
+    priorities:
+      [ $prio[] | { title: .title,
+                    why: (if txt(.code; "why") != "" then txt(.code; "why") else (.detail | split("\n")[0]) end),
+                    command: txt(.code; "cmd") } ],
+
+    noise:
+      [ ($noise[] | "\(.title) - \(txt(.code; "why"))"),
+        (.findings[]? | select(.code | startswith("baseline.")) | .title) ],
+
+    source: "triage" }
+' "$SCAN"
