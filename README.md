@@ -125,17 +125,35 @@ Set `HW_AUTOFIX=0` if you want it to report and never touch anything.
 git clone https://github.com/Mrtchouk/hostwatch
 cd hostwatch
 sudo ./install.sh
-sudo nano /etc/hostwatch/hostwatch.conf
-sudo hostwatch now
 ```
 
-The installer copies to `/opt/hostwatch`, writes the config, enables three
-systemd units and seeds the baselines. **The first run records the current state
-as trusted.** Install on a host you believe is clean, or you are teaching it that
-the backdoor belongs there.
+There is nothing to fill in first. The installer inspects the machine and writes
+a configuration that matches it:
 
-Configure at minimum: `HW_SERVICES`, `HW_SECRET_FILES`, `HW_WEBROOTS`,
-`HW_SITES`. Everything is a bash array in one file.
+```
+Detected on this host:
+  services   ssh nginx mariadb docker fail2ban redis-server
+  web roots  4 found
+  secrets    3 found
+  sites      6 from enabled vhosts
+  pm2        api worker (deploy)
+  database   reachable, checks enabled
+```
+
+Services come from what is actually running, hostnames from your enabled virtual
+hosts, secrets from the `.env` files sitting under your document roots. A generic
+default config would report on services you do not run and stay silent about the
+ones you do, which is worse than no tool at all.
+
+Then it copies to `/opt/hostwatch`, enables three systemd units and seeds the
+baselines. **That first run records the current state as trusted**, so install on
+a host you believe is clean, or you are teaching it that the backdoor belongs
+there.
+
+One thing detection cannot guess: `HW_URLS_FORBIDDEN`, the endpoints that must
+never answer 200 on your setup. Everything else is a bash array in
+`/etc/hostwatch/hostwatch.conf`, and `hostwatch-detect` reprints what the host
+looks like whenever you want to compare.
 
 ## Reporting
 
@@ -152,7 +170,7 @@ them:
 ## Files
 
 ```
-/etc/hostwatch/hostwatch.conf     configuration
+/etc/hostwatch/hostwatch.conf     configuration, generated at install time
 /var/lib/hostwatch/baseline/      learned reference state
 /var/lib/hostwatch/scans/         last 60 raw scans
 /var/lib/hostwatch/reports/       last 80 full reports

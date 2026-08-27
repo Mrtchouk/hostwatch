@@ -1,0 +1,188 @@
+#!/usr/bin/env bash
+# hostwatch-detect — writes a configuration matching this host, on stdout.
+#
+#   hostwatch-detect > /etc/hostwatch/hostwatch.conf
+#
+# Called by install.sh. Read-only: it inspects, it never changes anything.
+# Re-run it after adding a service, diff against your config.
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- services ---------------------------------------------------------------
+SERVICES=()
+for s in ssh sshd nginx apache2 caddy mariadb mysql postgresql docker containerd \
+         fail2ban redis-server memcached php8.2-fpm php8.3-fpm; do
+  active "$s" && SERVICES+=("$s")
+done
+
+# Several of these are aliases of one another: on Debian `mysql` is a symlink to
+# the mariadb unit, and `ssh` to sshd. Listing both means one stopped daemon
+# reports as two critical findings.
+listed() { printf '%s\n' "${SERVICES[@]}" | grep -qx "$1"; }
+drop() { local out=() s; for s in "${SERVICES[@]}"; do [ "$s" = "$1" ] || out+=("$s"); done; SERVICES=("${out[@]}"); }
+listed mariadb && listed mysql && drop mysql
+listed ssh && listed sshd && drop sshd
+
+# Restarting these interrupts what they serve, so they are not in the list the
+# tool may restart on its own.
+FIX_SERVICES=()
+for s in "${SERVICES[@]}"; do
+  [ -n "$s" ] || continue
+  case "$s" in mariadb|mysql|postgresql|docker|containerd) continue;; esac
+  FIX_SERVICES+=("$s")
+done
+
+# --- document roots ---------------------------------------------------------
+WEBROOTS=()
+for d in /var/www/* /srv/www/* /usr/share/nginx/html /srv/http; do
+  [ -d "$d" ] || continue
+  case "$d" in */html|*/lost+found) [ "$d" = /usr/share/nginx/html ] || continue;; esac
+  WEBROOTS+=("$d")
+done
+[ ${#WEBROOTS[@]} -eq 0 ] && [ -d /var/www ] && WEBROOTS=(/var/www)
+
+# --- secret files -----------------------------------------------------------
+SECRETS=()
+if [ ${#WEBROOTS[@]} -gt 0 ]; then
+  while IFS= read -r f; do SECRETS+=("$f"); done < <(
+    find "${WEBROOTS[@]}" -maxdepth 3 -type f \
+      \( -name '.env' -o -name '.env.local' -o -name '.env.production' \) 2>/dev/null | head -12)
+fi
+
+# --- public hostnames -------------------------------------------------------
+# server_name lines from an enabled site are what this host actually answers to.
+SITES=()
+if [ -d /etc/nginx ]; then
+  while IFS= read -r name; do SITES+=("https://$name"); done < <(
+    { cat /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; } 2>/dev/null \
+      | grep -hoE '^[[:space:]]*server_name[^;]+;' \
+      | sed -E 's/^[[:space:]]*server_name[[:space:]]*//; s/;$//' \
+      | tr ' ' '\n' | grep -vE '^$|^_$|localhost|\*|^~' | sort -u | head -6)
+fi
+if [ ${#SITES[@]} -eq 0 ] && [ -d /etc/apache2/sites-enabled ]; then
+  while IFS= read -r name; do SITES+=("https://$name"); done < <(
+    grep -rhoE '^[[:space:]]*ServerName[[:space:]]+[^ ]+' /etc/apache2/sites-enabled 2>/dev/null \
+      | awk '{print $2}' | grep -v localhost | sort -u | head -6)
+fi
+
+# --- database ---------------------------------------------------------------
+MYSQL=0
+if have mysql && mysql -uroot -N -e 'SELECT 1' >/dev/null 2>&1; then MYSQL=1; fi
+DBPORT=3306
+have psql && ! have mysql && DBPORT=5432
+
+# --- process manager --------------------------------------------------------
+PM2_USER=
+PM2_APPS=()
+if have pm2; then
+  PM2_USER=$(ps -eo user:32,cmd --no-headers 2>/dev/null | awk '/PM2 v|PM2\[/ {print $1; exit}')
+  if [ -n "$PM2_USER" ]; then
+    while IFS= read -r a; do PM2_APPS+=("$a"); done < <(
+      sudo -u "$PM2_USER" -H pm2 jlist 2>/dev/null | jq -r '.[].name' 2>/dev/null | head -12)
+  fi
+fi
+
+# --- container runtime ------------------------------------------------------
+PRUNE=()
+have docker && PRUNE+=(/var/lib/docker)
+[ -d /var/lib/containers ] && PRUNE+=(/var/lib/containers)
+[ ${#PRUNE[@]} -eq 0 ] && PRUNE=(/var/lib/docker)
+
+# --- log paths --------------------------------------------------------------
+ACCESS=/var/log/nginx/access.log
+ERROR=/var/log/nginx/error.log
+if [ ! -f "$ACCESS" ] && [ -f /var/log/apache2/access.log ]; then
+  ACCESS=/var/log/apache2/access.log
+  ERROR=/var/log/apache2/error.log
+fi
+
+arr() {  # arr NAME value...
+  local name=$1; shift
+  printf '%s=(' "$name"
+  local first=1 v
+  for v in "$@"; do
+    [ -n "$v" ] || continue
+    [ $first = 1 ] || printf ' '
+    printf '%s' "$v"; first=0
+  done
+  printf ')\n'
+}
+
+cat <<EOF
+# hostwatch configuration, generated on $(date '+%F') for $(hostname).
+# Re-run hostwatch-detect to see what a fresh scan of this host would produce.
+
+# --- Paths ------------------------------------------------------------------
+HW_LIB=/var/lib/hostwatch
+HW_LOG=/var/log/hostwatch.log
+
+# --- Output -----------------------------------------------------------------
+# Language of the analysis text and rule explanations: en | fr.
+# Finding titles come from the scan and stay in English.
+HW_LANG=en
+
+# --- Services ---------------------------------------------------------------
+# Detected as running. A service listed here that stops becomes a critical
+# finding, so remove anything you do not actually need up.
+$(arr HW_SERVICES "${SERVICES[@]}")
+
+# Process manager, detected. Leave HW_PM2_USER empty to skip.
+HW_PM2_USER=$PM2_USER
+$(arr HW_PM2_APPS "${PM2_APPS[@]}")
+
+# --- Files and web roots ----------------------------------------------------
+# Secret files found under the document roots below.
+$(arr HW_SECRET_FILES "${SECRETS[@]}")
+
+# Scanned for webshells and for archives that should not be downloadable.
+$(arr HW_WEBROOTS "${WEBROOTS[@]}")
+
+# --- HTTP checks ------------------------------------------------------------
+# Taken from the enabled virtual hosts. Expected to answer 2xx or 3xx.
+$(arr HW_SITES "${SITES[@]}")
+
+# URLs that must NOT answer 200. Installers and setup wizards left reachable are
+# a full takeover path. Nothing can detect yours: add them by hand.
+HW_URLS_FORBIDDEN=()
+
+# --- Database ---------------------------------------------------------------
+# 1 only if a socket connection as root succeeded during detection.
+HW_MYSQL=$MYSQL
+HW_MYSQL_PORT=$DBPORT
+
+# --- Thresholds -------------------------------------------------------------
+HW_DISK_WARN=82
+HW_DISK_CRIT=92
+HW_INODE_WARN=90
+HW_F2B_SPIKE=60
+HW_HTTP_SCAN_SPIKE=300
+HW_NGINX_ACCESS_LOG=$ACCESS
+HW_NGINX_ERROR_LOG=$ERROR
+
+# --- Paths excluded from the SUID sweep -------------------------------------
+# Image layers churn constantly and are not executable from the host.
+$(arr HW_SUID_PRUNE "${PRUNE[@]}")
+
+# --- Notifications ----------------------------------------------------------
+# File holding a Discord or Slack webhook URL, one line, chmod 600.
+# always: post every report. fallback: only when nothing else published it.
+HW_WEBHOOK_FILE=/etc/hostwatch/webhook
+HW_WEBHOOK_MODE=fallback
+
+# --- Automatic remediation --------------------------------------------------
+# 1: apply fixes that interrupt nothing, queue the rest for approval.
+# 0: report only, never touch the system.
+HW_AUTOFIX=1
+
+# Services hostwatch may start or restart. Databases and container runtimes are
+# deliberately absent: restarting those takes everything they serve down.
+$(arr HW_FIX_SERVICES "${FIX_SERVICES[@]}")
+$(arr HW_FIX_PM2_APPS "${PM2_APPS[@]}")
+
+# Packages whose upgrade restarts a service. Never upgraded automatically.
+HW_SERVICE_PKGS='^(mariadb|mysql|nginx|apache2|docker|containerd|redis|php[0-9.]*-fpm)'
+EOF

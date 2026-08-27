@@ -38,12 +38,29 @@ install -m 755 "$SRC"/bin/hostwatch*        "$PREFIX/bin/"
 install -m 644 "$SRC"/share/rules.json      "$PREFIX/share/"
 ln -sf "$PREFIX/bin/hostwatch" "$BINDIR/hostwatch"
 
+install -m 644 "$SRC/hostwatch.conf.example" "$CONFDIR/hostwatch.conf.example"
+
 if [ ! -f "$CONFDIR/hostwatch.conf" ]; then
-  install -m 640 "$SRC/hostwatch.conf.example" "$CONFDIR/hostwatch.conf"
-  echo "wrote $CONFDIR/hostwatch.conf from the example. Edit it before relying on the output."
+  # Inspect the host and write a configuration that matches it. A generic
+  # example config produces findings about services that are not installed and
+  # silence about the ones that are, which is worse than no tool at all.
+  "$PREFIX/bin/hostwatch-detect" > "$CONFDIR/hostwatch.conf"
+  chmod 640 "$CONFDIR/hostwatch.conf"
+  # shellcheck source=/dev/null
+  . "$CONFDIR/hostwatch.conf"
+  echo "Detected on this host:"
+  printf '  services   %s\n' "${HW_SERVICES[*]:-none}"
+  printf '  web roots  %s\n' "${#HW_WEBROOTS[@]} found"
+  printf '  secrets    %s\n' "${#HW_SECRET_FILES[@]} found"
+  printf '  sites      %s\n' "${#HW_SITES[@]} from enabled vhosts"
+  [ -n "${HW_PM2_USER:-}" ] && printf '  pm2        %s (%s)\n' "${HW_PM2_APPS[*]:-no app}" "$HW_PM2_USER"
+  [ "${HW_MYSQL:-0}" = 1 ] && printf '  database   reachable, checks enabled\n'
+  echo
+  echo "Written to $CONFDIR/hostwatch.conf. Read it once: what it could not guess"
+  echo "is HW_URLS_FORBIDDEN, the endpoints that must never answer 200."
 else
-  install -m 644 "$SRC/hostwatch.conf.example" "$CONFDIR/hostwatch.conf.example"
-  echo "kept your $CONFDIR/hostwatch.conf. New options are in hostwatch.conf.example."
+  echo "Kept your $CONFDIR/hostwatch.conf. New options are in hostwatch.conf.example."
+  echo "Re-run $PREFIX/bin/hostwatch-detect to see what this host looks like now."
 fi
 
 chmod 700 "$LIB/baseline"
