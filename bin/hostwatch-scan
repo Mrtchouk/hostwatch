@@ -1,0 +1,437 @@
+#!/usr/bin/env bash
+# hostwatch-scan — host inspection, structured JSON out.
+#
+#   hostwatch-scan [--mode full|fast] [--json] [--quiet] [--baseline-reset]
+#
+# full: every check. fast: the intrusion block only, cheap enough to run on a
+# short timer.
+#
+# Output keys are an interface contract for every consumer:
+#   ts host mode duration_s counts{crit,warn,info} findings[] metrics{}
+#
+# Exit: 0 clean, 1 warnings, 2 critical.
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+
+: "${HW_LIB:=/var/lib/hostwatch}"
+: "${HW_LOG:=/var/log/hostwatch.log}"
+: "${HW_MYSQL:=0}"
+: "${HW_MYSQL_PORT:=3306}"
+: "${HW_DISK_WARN:=82}"
+: "${HW_DISK_CRIT:=92}"
+: "${HW_INODE_WARN:=90}"
+: "${HW_F2B_SPIKE:=60}"
+: "${HW_HTTP_SCAN_SPIKE:=300}"
+: "${HW_NGINX_ACCESS_LOG:=/var/log/nginx/access.log}"
+: "${HW_NGINX_ERROR_LOG:=/var/log/nginx/error.log}"
+: "${HW_PM2_USER:=}"
+HW_SERVICES=("${HW_SERVICES[@]-ssh}")
+HW_PM2_APPS=("${HW_PM2_APPS[@]-}")
+HW_SECRET_FILES=("${HW_SECRET_FILES[@]-}")
+HW_WEBROOTS=("${HW_WEBROOTS[@]-}")
+HW_SITES=("${HW_SITES[@]-}")
+HW_URLS_FORBIDDEN=("${HW_URLS_FORBIDDEN[@]-}")
+HW_SUID_PRUNE=("${HW_SUID_PRUNE[@]-/var/lib/docker}")
+
+MODE=full WANT_JSON=0 QUIET=0 BASELINE_RESET=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --mode) MODE=${2:-full}; shift 2;;
+    --fast) MODE=fast; shift;;
+    --json) WANT_JSON=1; shift;;
+    --quiet) QUIET=1; shift;;
+    --baseline-reset) BASELINE_RESET=1; shift;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0;;
+    *) shift;;
+  esac
+done
+
+BASE=$HW_LIB/baseline
+SCANS=$HW_LIB/scans
+mkdir -p "$BASE" "$SCANS" "$HW_LIB/state" "$HW_LIB/tmp"
+chmod 755 "$HW_LIB" "$SCANS"
+
+# The short timer and the full timer overlap sooner or later. Two scans writing
+# the same baseline files means drift is recorded by one run and never reported
+# by the other.
+exec 9>"$HW_LIB/state/scan.lock"
+flock -w 300 9 || { echo "another scan holds the lock" >&2; exit 3; }
+
+TS=$(date '+%F %T')
+TSFILE=$(date '+%Y%m%d-%H%M%S')
+START=$(date +%s)
+HOST=$(hostname)
+WORK=$(mktemp -d "$HW_LIB/tmp/scan.XXXXXX")
+trap 'rm -rf "$WORK"' EXIT
+FINDINGS=$WORK/findings.ndjson
+: > "$FINDINGS"
+
+FULL=0; [ "$MODE" = full ] && FULL=1
+
+# --- JSON serialisation ------------------------------------------------------
+# One jq invocation per finding costs ~35 forks per scan. Escape in bash and
+# assemble once at the end.
+json_str() {
+  local s=${1-}
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+  s=${s//[[:cntrl:]]/}
+  printf '"%s"' "$s"
+}
+
+emit() {
+  printf '{"level":%s,"code":%s,"title":%s,"detail":%s}\n' \
+    "$(json_str "$1")" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "${4-}")" >> "$FINDINGS"
+}
+
+# --- Baseline drift ----------------------------------------------------------
+# Current state on stdin. First run learns silently; afterwards any new line is
+# a finding. Added and removed take separate levels on purpose: an SSH key that
+# appears is a backdoor, one that disappears is housekeeping. A port that opens
+# is suspicious, one that closes is a service someone stopped. Without that
+# split the routine cries wolf on every restart and stops being read.
+baseline_diff() {
+  local name=$1 lvl=$2 code=$3 title=$4 lvl_rm=${5:-$2}
+  local f=$BASE/$name cur=$WORK/bl.$name
+  sort -u > "$cur"
+  if [ ! -f "$f" ] || [ "$BASELINE_RESET" = 1 ]; then
+    cp "$cur" "$f"; chmod 600 "$f"
+    emit info "baseline.$name" "Baseline '$name' initialised" "$(wc -l < "$cur") entries recorded as reference state."
+    return 0
+  fi
+  local added removed
+  added=$(comm -13 "$f" "$cur" | head -20)
+  removed=$(comm -23 "$f" "$cur" | head -20)
+  [ -n "$added" ]   && emit "$lvl"    "$code"    "$title (added)"   "ADDED:"$'\n'"$added"
+  [ -n "$removed" ] && emit "$lvl_rm" "$code.rm" "$title (removed)" "REMOVED:"$'\n'"$removed"
+  # Absorb the change so a single drift alerts once, not every cycle.
+  [ -n "$added$removed" ] && { cp "$cur" "$f"; chmod 600 "$f"; }
+  return 0
+}
+
+# --- Shared inputs -----------------------------------------------------------
+# Collected once and reused. The previous generation of this script read the
+# journal twice and the nginx log three times.
+SSHLOG=$WORK/ssh.log
+: > "$SSHLOG"
+command -v journalctl >/dev/null &&
+  journalctl -u ssh -u sshd --since "-24h" --no-pager -q 2>/dev/null \
+    | grep -aE "Accepted|Failed password|Invalid user|Failed publickey|POSSIBLE BREAK" > "$SSHLOG"
+
+IPT=$WORK/iptables.txt
+iptables -S 2>/dev/null > "$IPT" || : > "$IPT"
+
+APT=$WORK/apt.txt
+: > "$APT"
+[ "$FULL" = 1 ] && command -v apt-get >/dev/null &&
+  apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep '^Inst ' > "$APT"
+
+# HTTP probes are the slowest part and are independent: fire them now, collect
+# after the local checks have run.
+HTTPDIR=$WORK/http; mkdir -p "$HTTPDIR"
+http_probe() { curl -sS -o /dev/null -w '%{http_code}' --max-time 12 "$1" 2>/dev/null || echo 000; }
+if [ "$FULL" = 1 ]; then
+  i=0
+  for u in "${HW_SITES[@]}" "${HW_URLS_FORBIDDEN[@]}"; do
+    [ -n "$u" ] || continue
+    i=$((i+1)); ( http_probe "$u" > "$HTTPDIR/$i" ) &
+  done
+fi
+
+# ============================================================================
+# Block A — intrusion and compromise. Runs in both modes.
+# ============================================================================
+
+# A1 — authorised SSH keys. An added key is backdoor number one.
+{
+  for f in /root/.ssh/authorized_keys /root/.ssh/authorized_keys2 \
+           /home/*/.ssh/authorized_keys /etc/ssh/authorized_keys.d/*; do
+    [ -f "$f" ] || continue
+    while read -r line; do
+      case "$line" in ''|\#*) continue;; esac
+      printf '%s :: %s\n' "$f" "$(printf '%s' "$line" | awk '{print $1" "substr($2,1,16)"... "$3}')"
+    done < "$f"
+  done
+} | baseline_diff authorized_keys crit sshkeys.drift "Authorised SSH keys changed" info
+
+# A2 — UID 0 accounts, passwordless accounts, login shells.
+{
+  awk -F: '$3==0 {print "uid0: "$1}' /etc/passwd
+  awk -F: '$2=="" {print "nopass: "$1}' /etc/shadow 2>/dev/null
+  awk -F: '$3>=1000 && $3<65534 {print "user: "$1" shell="$7}' /etc/passwd
+} | baseline_diff accounts crit accounts.drift "System accounts changed" warn
+
+# A3 — successful SSH logins. A source IP never seen before is the signal.
+SSH_ACCEPTED=$(grep -aoE "Accepted (publickey|password|keyboard-interactive[^ ]*) for [^ ]+ from [0-9a-fA-F.:]+" "$SSHLOG" \
+               | awk '{print $NF" "$(NF-2)}' | sort | uniq -c | sort -rn | head -15)
+SSH_FAILED=$(grep -acE "Failed password|Invalid user|Failed publickey" "$SSHLOG")
+SSH_NEWIP=""
+ipsnow=$(printf '%s\n' "$SSH_ACCEPTED" | awk '{print $2}' | grep -E '^[0-9a-fA-F.:]+$' | sort -u)
+known=$BASE/ssh_known_ips; touch "$known"; chmod 600 "$known"
+if [ -n "$ipsnow" ]; then
+  SSH_NEWIP=$(comm -13 <(sort -u "$known") <(printf '%s\n' "$ipsnow"))
+  if [ -n "$SSH_NEWIP" ] && [ -s "$known" ]; then
+    emit crit sshlogin.newip "Successful SSH login from an unknown IP" \
+      "$(printf '%s\n' "$SSH_NEWIP" | sed 's/^/  - /')"$'\n'"Added to known IPs. If this was not you: revoke keys, check for persistence."
+  fi
+  printf '%s\n' "$ipsnow" >> "$known"; sort -u -o "$known" "$known"
+fi
+
+# A4 — userland rootkit preload.
+[ -s /etc/ld.so.preload ] && emit crit rootkit.preload "/etc/ld.so.preload is not empty" "$(head -5 /etc/ld.so.preload)"
+
+# A5 — miners, binaries running from world-writable paths, reverse shells.
+SUSPECT=$(ps -eo user:16,pid,etime,cmd --no-headers 2>/dev/null \
+  | grep -viE "grep|hostwatch" \
+  | grep -iE "xmrig|kdevtmpfsi|kinsing|minerd|cryptonight|/tmp/\.|/dev/shm/|/var/tmp/[a-z0-9]{6,}|nc +-l|ncat +-l|socat .*exec|bash +-i +>& */dev/tcp" \
+  | head -8)
+[ -n "$SUSPECT" ] && emit crit proc.suspect "Suspicious process running" "$SUSPECT"
+
+# A6 — new public listeners.
+ss -tlnH 2>/dev/null | awk '{print $4}' | grep -vE "^127\.|^\[::1\]|^\[::ffff:127" \
+  | baseline_diff ports warn ports.drift "Public listening ports changed" info
+
+# A7 — critical services.
+DOWN=""
+for svc in "${HW_SERVICES[@]}"; do
+  [ -n "$svc" ] || continue
+  systemctl is-active --quiet "$svc" 2>/dev/null || DOWN+="$svc "
+done
+[ -n "$DOWN" ] && emit crit service.down "Critical service stopped" "${DOWN% }"
+
+PM2_RESTARTS=""
+if [ -n "$HW_PM2_USER" ]; then
+  pm2list=$(sudo -u "$HW_PM2_USER" -H pm2 jlist 2>/dev/null)
+  if [ -n "$pm2list" ]; then
+    bad=$(printf '%s' "$pm2list" | jq -r '.[] | select(.pm2_env.status!="online") | .name' 2>/dev/null | paste -sd' ')
+    [ -n "${bad:-}" ] && emit crit service.pm2 "PM2 process offline" "$bad"
+    PM2_RESTARTS=$(printf '%s' "$pm2list" | jq -r '.[] | "\(.name):\(.pm2_env.restart_time)"' 2>/dev/null | paste -sd' ')
+  fi
+fi
+
+# A8 — recently modified PHP carrying execution primitives.
+if [ "$FULL" = 1 ]; then
+  WS=""
+  for wr in "${HW_WEBROOTS[@]}"; do
+    [ -n "$wr" ] && [ -d "$wr" ] || continue
+    hits=$(find "$wr" -type f \( -name '*.php' -o -name '*.phtml' \) -mtime -2 \
+      -exec grep -lE "eval *\(|base64_decode *\(|shell_exec *\(|passthru *\(|assert *\(\\\$|system *\(\\\$" {} + \
+      2>/dev/null | head -5)
+    [ -n "$hits" ] && WS+="$hits"$'\n'
+  done
+  [ -n "$WS" ] && emit crit webshell.suspect "Recent PHP file with execution primitives" "$WS"
+fi
+
+# A9 — hashes of the configuration that grants access.
+{
+  for f in /etc/ssh/sshd_config /etc/passwd /etc/group /etc/sudoers /etc/hosts /etc/crontab; do
+    [ -f "$f" ] && sha256sum "$f"
+  done
+  for d in /etc/ssh/sshd_config.d /etc/sudoers.d /etc/nginx/sites-enabled /etc/nginx/conf.d /etc/cron.d; do
+    [ -d "$d" ] && find "$d" -maxdepth 1 -type f -exec sha256sum {} \; 2>/dev/null
+  done
+} | baseline_diff configs warn config.drift "System configuration changed"
+
+# ============================================================================
+# Block B — posture and hygiene. Full mode only.
+# ============================================================================
+BANS=0 NGINX_HITS=0 NGINX_TOP="" DBCONN=0
+if [ "$FULL" = 1 ]; then
+
+# B1 — certificates.
+for cert in /etc/letsencrypt/live/*/cert.pem; do
+  [ -f "$cert" ] || continue
+  name=$(basename "$(dirname "$cert")")
+  end=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+  ends=$(date -d "$end" +%s 2>/dev/null || echo 0)
+  days=$(( (ends - $(date +%s)) / 86400 ))
+  if   [ "$ends" -eq 0 ];  then emit warn ssl.unreadable "Unreadable certificate ($name)" ""
+  elif [ "$days" -lt 0 ];  then emit crit ssl.expired "Certificate expired ($name)" "Expired $(( -days )) days ago"
+  elif [ "$days" -lt 14 ]; then emit warn ssl.soon "Certificate $name expires in ${days} days" "Check renewal: certbot renew --dry-run"
+  fi
+done
+
+# B2 — a deleted ACME account fails renewal silently until the cert expires.
+if tail -200 /var/log/letsencrypt/letsencrypt.log 2>/dev/null | grep -qiE "AccountNotFound|Account at .* does not exist"; then
+  emit warn certbot.account "certbot reported an account error" "Automatic renewal is probably broken."
+fi
+
+# B3 — world-readable secrets.
+for env in "${HW_SECRET_FILES[@]}"; do
+  [ -n "$env" ] && [ -f "$env" ] || continue
+  perm=$(stat -c '%a' "$env" 2>/dev/null); last=${perm: -1}
+  [ -n "$last" ] && [ $(( last & 4 )) -ne 0 ] &&
+    emit crit secret.worldread "Secret file readable by everyone" "$env (mode $perm) - chmod 640"
+done
+
+# B4 — database exposure.
+if [ "$HW_MYSQL" = 1 ] && command -v mysql >/dev/null; then
+  badsuper=$(mysql -uroot -N -e "SELECT GROUP_CONCAT(CONCAT(User,'@',Host)) FROM mysql.user WHERE Host IN ('%','0.0.0.0') AND Super_priv='Y';" 2>/dev/null)
+  [ -n "${badsuper:-}" ] && [ "$badsuper" != NULL ] && emit crit db.super "Database super privilege on a wildcard host" "$badsuper"
+  rootremote=$(mysql -uroot -N -e "SELECT GROUP_CONCAT(Host) FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost','127.0.0.1','::1');" 2>/dev/null)
+  [ -n "${rootremote:-}" ] && [ "$rootremote" != NULL ] && emit crit db.rootremote "Database root reachable remotely" "$rootremote"
+  grep -qE "dport $HW_MYSQL_PORT -j DROP" "$IPT" ||
+    emit warn db.noblock "No external DROP rule on port $HW_MYSQL_PORT" "Exposed if the daemon binds 0.0.0.0."
+  DBCONN=$(mysql -uroot -N -e "SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE HOST NOT LIKE 'localhost%' AND HOST NOT LIKE '127.0.0.1%';" 2>/dev/null || echo 0)
+fi
+
+# B5 — firewall drift. Docker and fail2ban chains are noise.
+grep -vE "^-A DOCKER|^-A f2b-|^-N f2b-" "$IPT" | baseline_diff iptables warn fw.drift "Firewall rules changed"
+
+# B6 — SUID/SGID drift.
+prune=()
+for p in "${HW_SUID_PRUNE[@]}"; do [ -n "$p" ] && prune+=(-path "$p" -o); done
+if [ ${#prune[@]} -gt 0 ]; then
+  unset 'prune[${#prune[@]}-1]'
+  find / -xdev \( "${prune[@]}" \) -prune -o \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null \
+    | baseline_diff suid crit suid.drift "SUID/SGID binaries changed" info
+else
+  find / -xdev \( -perm -4000 -o -perm -2000 \) -type f -print 2>/dev/null \
+    | baseline_diff suid crit suid.drift "SUID/SGID binaries changed" info
+fi
+
+# B7 — scheduled work.
+{
+  crontab -l 2>/dev/null | grep -vE '^\s*#'
+  while IFS=: read -r u _; do
+    c=$(crontab -u "$u" -l 2>/dev/null | grep -vE '^\s*#'); [ -n "$c" ] && printf '%s: %s\n' "$u" "$c"
+  done < /etc/passwd
+  systemctl list-timers --all --no-pager 2>/dev/null | awk 'NF>4 && $NF ~ /\.service$/ {print "timer: "$NF}'
+} | baseline_diff cron warn cron.drift "Scheduled tasks changed"
+
+# B8 — disk and inodes.
+use=$(df / --output=pcent 2>/dev/null | tail -1 | tr -dc '0-9')
+if [ -n "$use" ]; then
+  if   [ "$use" -ge "$HW_DISK_CRIT" ]; then emit crit disk.full "Root filesystem at ${use}%" "$(df -h / | tail -1)"
+  elif [ "$use" -ge "$HW_DISK_WARN" ]; then emit warn disk.high "Root filesystem at ${use}%" "$(df -h / | tail -1)"
+  fi
+fi
+inode=$(df -i / --output=ipcent 2>/dev/null | tail -1 | tr -dc '0-9')
+[ -n "${inode:-}" ] && [ "$inode" -ge "$HW_INODE_WARN" ] && emit warn disk.inodes "Root inodes at ${inode}%" ""
+
+# B9 — things that should never sit under a document root.
+for wr in "${HW_WEBROOTS[@]}"; do
+  [ -n "$wr" ] && [ -d "$wr" ] || continue
+  found=$(find "$wr" -maxdepth 3 \( -name '.env' -o -name '.git' -o -iname '*.sql' -o -iname '*.bak' \
+          -o -iname '*.zip' -o -iname '*.tar.gz' -o -iname '*.sql.gz' \) 2>/dev/null | head -5)
+  [ -n "$found" ] && emit warn webroot.sensitive "Sensitive file under a web root" "$wr -> $(printf '%s ' $found)"
+done
+
+# B10 — fail2ban volume.
+if command -v fail2ban-client >/dev/null; then
+  for jail in $(fail2ban-client status 2>/dev/null | awk -F'\t' '/Jail list/{print $2}' | tr -d ' ' | tr ',' ' '); do
+    n=$(fail2ban-client status "$jail" 2>/dev/null | grep -i "Currently banned" | grep -oE "[0-9]+$")
+    [ -n "${n:-}" ] && BANS=$(( BANS + n ))
+  done
+  [ "$BANS" -gt "$HW_F2B_SPIKE" ] && emit warn f2b.spike "fail2ban has ${BANS} banned IPs" "Attack in progress (threshold $HW_F2B_SPIKE)."
+fi
+
+# B11 — pending security updates.
+if [ -s "$APT" ]; then
+  sec=$(grep -ci security "$APT")
+  [ "${sec:-0}" -gt 0 ] &&
+    emit warn apt.security "${sec} security update(s) pending" "$(grep -i security "$APT" | awk '{print $2}' | head -10 | paste -sd' ')"
+fi
+[ -f /var/run/reboot-required ] &&
+  emit warn kernel.reboot "Reboot required (kernel or libraries)" "$(cat /var/run/reboot-required.pkgs 2>/dev/null | paste -sd' ')"
+
+# B12 — HTTP reconnaissance.
+if [ -f "$HW_NGINX_ACCESS_LOG" ]; then
+  probe=$WORK/nginx.hits
+  grep -aiE "/\.env|/installer|/wp-(login|admin|content)|/phpmyadmin|/\.git/|sqlmap|nikto|/vendor/phpunit|/actuator|/cgi-bin/" \
+    "$HW_NGINX_ACCESS_LOG" 2>/dev/null > "$probe"
+  NGINX_HITS=$(wc -l < "$probe")
+  # paste -sd', ' alternates the two delimiters; one delimiter, then space it.
+  NGINX_TOP=$(awk '{print $1}' "$probe" | sort | uniq -c | sort -rn | head -5 \
+              | awk '{print $2" ("$1")"}' | paste -sd',' - | sed 's/,/, /g')
+  [ "$NGINX_HITS" -gt "$HW_HTTP_SCAN_SPIKE" ] &&
+    emit warn http.scan "${NGINX_HITS} requests against sensitive paths" "Top sources: ${NGINX_TOP:-n/a}"
+  # A 200 on one of those paths means something answered.
+  leaked=$(grep -aiE "\"(GET|POST) [^\"]*(/\.env|/\.git/|/installer)[^\"]*\" 200 " "$probe" 2>/dev/null | tail -3)
+  [ -n "$leaked" ] && emit crit http.leak "HTTP 200 on a sensitive path" "$leaked"
+fi
+
+# B13 — container port publishing drift.
+command -v docker >/dev/null &&
+  docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -oE "0\.0\.0\.0:[0-9]+" | sort -u \
+    | baseline_diff docker_ports warn docker.drift "Docker 0.0.0.0 publications changed" info
+
+# B14 — HTTP probes fired earlier.
+wait
+i=0
+for u in "${HW_SITES[@]}"; do
+  [ -n "$u" ] || continue
+  i=$((i+1)); code=$(cat "$HTTPDIR/$i" 2>/dev/null || echo 000)
+  case "$code" in 2*|3*) ;; *) emit warn site.down "$u answered $code" "";; esac
+done
+for u in "${HW_URLS_FORBIDDEN[@]}"; do
+  [ -n "$u" ] || continue
+  i=$((i+1)); code=$(cat "$HTTPDIR/$i" 2>/dev/null || echo 000)
+  [ "$code" = 200 ] && emit crit url.exposed "$u is reachable (HTTP 200)" \
+    "This endpoint is expected to be closed. Anyone can reach it right now."
+done
+
+fi  # end block B
+wait
+
+# ============================================================================
+# Assembly
+# ============================================================================
+DUR=$(( $(date +%s) - START ))
+
+METRICS=$(jq -nc \
+  --arg uptime "$(uptime -p 2>/dev/null)" \
+  --arg load "$(cut -d' ' -f1-3 /proc/loadavg)" \
+  --arg disk "$(df -h / | tail -1 | awk '{print $5" used ("$3"/"$2")"}')" \
+  --arg mem "$(free -h | awk '/Mem:/{print $3"/"$2}')" \
+  --arg ssh_accepted "${SSH_ACCEPTED:-}" \
+  --argjson ssh_failed "${SSH_FAILED:-0}" \
+  --arg ssh_newip "${SSH_NEWIP:-}" \
+  --argjson bans "${BANS:-0}" \
+  --argjson db_remote "${DBCONN:-0}" \
+  --argjson http_scan "${NGINX_HITS:-0}" \
+  --arg http_top "${NGINX_TOP:-}" \
+  --arg pm2 "${PM2_RESTARTS:-}" \
+  '{uptime:$uptime,load:$load,disk:$disk,mem:$mem,ssh_accepted_24h:$ssh_accepted,
+    ssh_failed_24h:$ssh_failed,ssh_new_ips:$ssh_newip,fail2ban_banned:$bans,
+    db_remote_conns:$db_remote,http_scan_hits:$http_scan,http_scan_top:$http_top,
+    pm2_restarts:$pm2}' 2>/dev/null || echo '{}')
+
+REPORT=$(jq -s --arg ts "$TS" --arg host "$HOST" --arg mode "$MODE" --argjson dur "$DUR" --argjson m "$METRICS" '
+  { ts:$ts, host:$host, mode:$mode, duration_s:$dur,
+    counts: { crit:(map(select(.level=="crit"))|length),
+              warn:(map(select(.level=="warn"))|length),
+              info:(map(select(.level=="info"))|length) },
+    findings:., metrics:$m }' "$FINDINGS" 2>/dev/null)
+
+[ -z "$REPORT" ] && REPORT=$(jq -nc --arg ts "$TS" \
+  '{ts:$ts,error:"report assembly failed",counts:{crit:0,warn:0,info:0},findings:[],metrics:{}}')
+
+printf '%s' "$REPORT" > "$SCANS/last.json"
+printf '%s' "$REPORT" > "$SCANS/$TSFILE-$MODE.json"
+chmod 644 "$SCANS/last.json" "$SCANS/$TSFILE-$MODE.json"
+ls -1t "$SCANS"/*.json 2>/dev/null | tail -n +61 | xargs -r rm -f
+
+NC=$(printf '%s' "$REPORT" | jq -r '.counts.crit')
+NW=$(printf '%s' "$REPORT" | jq -r '.counts.warn')
+
+if [ "$QUIET" != 1 ]; then
+  {
+    echo "=== [$TS] hostwatch ($MODE, ${DUR}s) ==="
+    printf '%s' "$REPORT" | jq -r '.findings[] | select(.level=="crit") | "[CRIT] \(.title)\n       \(.detail|gsub("\n";"\n       "))"'
+    printf '%s' "$REPORT" | jq -r '.findings[] | select(.level=="warn") | "[WARN] \(.title)"'
+    [ "$NC" = 0 ] && [ "$NW" = 0 ] && echo "clean"
+  } >> "$HW_LOG"
+  tail -3000 "$HW_LOG" > "$HW_LOG.tmp" 2>/dev/null && mv "$HW_LOG.tmp" "$HW_LOG"
+fi
+
+[ "$WANT_JSON" = 1 ] && printf '%s\n' "$REPORT"
+
+[ "$NC" -gt 0 ] && exit 2
+[ "$NW" -gt 0 ] && exit 1
+exit 0

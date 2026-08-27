@@ -1,0 +1,69 @@
+# hostwatch configuration. Copy to /etc/hostwatch/hostwatch.conf and edit.
+# Sourced by bash: use arrays, no spaces around '='.
+
+# --- Paths ------------------------------------------------------------------
+HW_LIB=/var/lib/hostwatch
+HW_LOG=/var/log/hostwatch.log
+
+# --- Output -----------------------------------------------------------------
+# Language of the analysis text and rule explanations: en | fr.
+# Finding titles come from the scan and stay in English.
+HW_LANG=en
+
+# --- Services ---------------------------------------------------------------
+# systemd units expected to be active.
+HW_SERVICES=(ssh nginx fail2ban)
+
+# PM2 process manager (optional). Leave HW_PM2_USER empty to skip.
+HW_PM2_USER=
+HW_PM2_APPS=()
+
+# --- Files and web roots ----------------------------------------------------
+# Secret files that must not be world-readable.
+HW_SECRET_FILES=(/var/www/app/.env)
+
+# Document roots scanned for webshells and leaked archives.
+HW_WEBROOTS=(/var/www/html)
+
+# --- HTTP checks ------------------------------------------------------------
+# URLs expected to answer 2xx or 3xx.
+HW_SITES=(https://example.com)
+
+# URLs that must NOT answer 200. Installers and setup wizards left reachable
+# are a full takeover path; list yours here.
+HW_URLS_FORBIDDEN=()
+
+# --- Database ---------------------------------------------------------------
+# Requires socket auth as root. Set to 0 to skip all database checks.
+HW_MYSQL=0
+HW_MYSQL_PORT=3306
+
+# --- Thresholds -------------------------------------------------------------
+HW_DISK_WARN=82
+HW_DISK_CRIT=92
+HW_INODE_WARN=90
+HW_F2B_SPIKE=60
+HW_HTTP_SCAN_SPIKE=300
+HW_NGINX_ACCESS_LOG=/var/log/nginx/access.log
+HW_NGINX_ERROR_LOG=/var/log/nginx/error.log
+
+# --- Paths excluded from the SUID sweep -------------------------------------
+# Container image layers churn constantly and are not executable from the host.
+HW_SUID_PRUNE=(/var/lib/docker /var/lib/containers)
+
+# --- Notifications ----------------------------------------------------------
+# File holding a Discord/Slack-compatible webhook URL (chmod 600).
+# Used as a fallback when the outbox is not drained by a bot.
+HW_WEBHOOK_FILE=/etc/hostwatch/webhook
+
+# --- Automatic remediation --------------------------------------------------
+# 1: apply fixes that interrupt nothing, queue the rest for approval.
+# 0: report only, never touch the system.
+HW_AUTOFIX=1
+
+# Services hostwatch may start or restart, and PM2 apps it may reload.
+HW_FIX_SERVICES=(nginx fail2ban)
+HW_FIX_PM2_APPS=()
+
+# Packages whose upgrade restarts a service. Never upgraded automatically.
+HW_SERVICE_PKGS='^(mariadb|mysql|nginx|apache2|docker|containerd|redis|php[0-9.]*-fpm)'
