@@ -41,10 +41,11 @@ background traffic on any public address.
 
 ## Why this exists
 
-I run one server. It hosts game servers, a panel, a dashboard and a database,
-and I am the only person who looks after it. Everything I tried was built for
-somebody else: hosted agents that want an account and ship your logs to a third
-party, or full SIEM stacks that need more attention than the box they watch.
+I run one server. It hosts a handful of services, a control panel, a dashboard
+and a database, and I am the only person who looks after it. Everything I tried
+was built for somebody else: hosted agents that want an account and ship your
+logs to a third party, or full SIEM stacks that need more attention than the box
+they watch.
 
 The alternative most people fall back on is a cron job mailing them the output
 of a few commands. That works for about a week. Then the noise wins: the
