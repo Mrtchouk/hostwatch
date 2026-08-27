@@ -1,0 +1,32 @@
+name: checks
+
+on: [push, pull_request]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck
+        run: shellcheck -S warning bin/hostwatch* install.sh
+
+      - name: bash syntax
+        run: |
+          for f in bin/hostwatch* install.sh; do bash -n "$f"; done
+
+      - name: rule table is valid json
+        run: jq -e . share/rules.json > /dev/null
+
+      - name: every finding code has a rule
+        run: |
+          # A code emitted by the scan with no entry here reaches the operator
+          # with no explanation and no command to run.
+          missing=0
+          for code in $(grep -oE 'emit (crit|warn) [a-z0-9.]+' bin/hostwatch-scan | awk '{print $3}' | sort -u); do
+            jq -e --arg c "$code" 'has($c)' share/rules.json > /dev/null || { echo "no rule for $code"; missing=1; }
+          done
+          exit $missing
+
+      - name: discord bot syntax
+        run: node --check integrations/discord-bot/hostwatch-discord.js
