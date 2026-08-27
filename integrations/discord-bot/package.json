@@ -1,0 +1,13 @@
+{
+  "name": "hostwatch-discord",
+  "version": "1.0.0",
+  "description": "Publishes hostwatch reports to Discord and carries approval decisions back",
+  "main": "hostwatch-discord.js",
+  "scripts": {
+    "start": "node hostwatch-discord.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0"
+  },
+  "license": "MIT"
+}
