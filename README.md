@@ -1,5 +1,7 @@
 # hostwatch
 
+[![checks](https://github.com/Mrtchouk/hostwatch/actions/workflows/checks.yml/badge.svg)](https://github.com/Mrtchouk/hostwatch/actions/workflows/checks.yml)
+
 Intrusion and drift detection for a single Linux server, in bash. It scans, it
 decides whether what it found matters, it fixes what it can fix without
 interrupting anything, and it asks before touching what would.
