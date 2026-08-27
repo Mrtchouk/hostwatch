@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# hostwatch-report — scan, remediate, analyse, publish.
+#
+#   hostwatch-report --kind periodic          full report
+#   hostwatch-report --kind alert             short timer, publishes only on new findings
+#   hostwatch-report --kind manual --id <id> [--user <who>]
+#
+# Writes:
+#   $HW_LIB/reports/<ts>-<kind>.json   archive
+#   $HW_LIB/outbox/<ts>-<kind>.json    waiting to be published
+#   $HW_LIB/replies/<id>.json          answer to an on-demand request
+#
+# Consumers only read those files. Nothing that publishes a report needs any
+# privilege of its own.
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
+export LC_ALL=C.UTF-8
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${HW_LIB:=/var/lib/hostwatch}"
+: "${HW_AUTOFIX:=1}"
+: "${HW_WEBHOOK_FILE:=/etc/hostwatch/webhook}"
+: "${HW_WEBHOOK_MODE:=fallback}"     # always | fallback | never
+: "${HW_OUTBOX_GROUP:=}"
+
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+mkdir -p "$HW_LIB"/{reports,outbox,replies,state}
+chmod 755 "$HW_LIB" "$HW_LIB/reports" "$HW_LIB/replies"
+
+# The outbox is the one directory a consumer writes to: it deletes each report
+# once published. Group-writable with setgid, or nothing gets cleaned up.
+if [ -n "$HW_OUTBOX_GROUP" ] && chgrp "$HW_OUTBOX_GROUP" "$HW_LIB/outbox" 2>/dev/null; then
+  chmod 2775 "$HW_LIB/outbox"
+else
+  chmod 755 "$HW_LIB/outbox"
+fi
+find "$HW_LIB/outbox" -name '*.json' -mmin +120 -delete 2>/dev/null
+
+KIND=periodic REQID="" USERID="" NOFIX=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kind) KIND=${2:-periodic}; shift 2;;
+    --id)   REQID=$(printf '%s' "${2:-}" | tr -cd 'A-Za-z0-9-' | head -c 40); shift 2;;
+    --user) USERID=$(printf '%s' "${2:-}" | tr -cd 'A-Za-z0-9_.-' | head -c 40); shift 2;;
+    --no-fix) NOFIX=1; shift;;
+    *) shift;;
+  esac
+done
+
+TSFILE=$(date '+%Y%m%d-%H%M%S')
+
+case "$KIND" in alert) SCANMODE=fast;; *) SCANMODE=full;; esac
+"$BIN/hostwatch-scan" --mode "$SCANMODE" >/dev/null 2>&1
+SCAN=$HW_LIB/scans/last.json
+[ -s "$SCAN" ] || { echo "scan unreadable" >&2; exit 3; }
+
+CRIT=$(jq -r '.counts.crit' "$SCAN"); WARN=$(jq -r '.counts.warn' "$SCAN")
+
+# Deduplication. On the short timer, only findings never seen in the last 24h
+# are worth waking anyone up for.
+STATE=$HW_LIB/state/alerted.tsv; touch "$STATE"
+NOW=$(date +%s)
+awk -F'\t' -v n="$NOW" '($2+86400)>n' "$STATE" > "$STATE.tmp" 2>/dev/null && mv "$STATE.tmp" "$STATE"
+
+NEWCOUNT=0
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  fp=$(printf '%s' "$line" | sha1sum | cut -c1-16)
+  grep -q "^$fp	" "$STATE" || { printf '%s\t%s\n' "$fp" "$NOW" >> "$STATE"; NEWCOUNT=$((NEWCOUNT+1)); }
+done < <(jq -r '.findings[] | select(.level=="crit" or (.level=="warn" and (.code|test("drift"))))
+                | [.level,.code,.title,(.detail|tostring)] | @tsv' "$SCAN" 2>/dev/null)
+
+[ "$KIND" = alert ] && [ "$NEWCOUNT" -eq 0 ] && exit 0
+
+# Remediation runs before analysis so the analysis sees the state after repair
+# and does not recommend what has already been done.
+AUTOFIX='{"done":[],"pending":[]}'
+if [ "$NOFIX" != 1 ] && [ "$HW_AUTOFIX" = 1 ]; then
+  AUTOFIX=$("$BIN/hostwatch-autofix" "$SCAN" 2>/dev/null)
+  printf '%s' "$AUTOFIX" | jq -e . >/dev/null 2>&1 || AUTOFIX='{"done":[],"pending":[]}'
+fi
+PENDING_ALL=$(jq -s '[.[] | select(.status=="waiting" or .status=="scheduled")]' "$HW_LIB/pending"/*.json 2>/dev/null)
+[ -z "$PENDING_ALL" ] && PENDING_ALL='[]'
+
+ANALYSIS=$("$BIN/hostwatch-triage" "$SCAN" 2>/dev/null)
+printf '%s' "$ANALYSIS" | jq -e '.verdict' >/dev/null 2>&1 ||
+  ANALYSIS='{"verdict":"watch","summary":"Analysis unavailable.","analysis":"","priorities":[],"noise":[],"source":"none"}'
+
+REPORT=$(jq -nc \
+  --arg id "$TSFILE${REQID:+-$REQID}" --arg kind "$KIND" --arg ts "$(date '+%F %T')" \
+  --arg user "$USERID" --arg reqid "$REQID" --argjson new "$NEWCOUNT" \
+  --slurpfile scan "$SCAN" --argjson analysis "$ANALYSIS" \
+  --argjson fix "$AUTOFIX" --argjson pend "$PENDING_ALL" \
+  '{id:$id, kind:$kind, ts:$ts,
+    requester:(if $user=="" then null else $user end),
+    request_id:(if $reqid=="" then null else $reqid end),
+    new_findings:$new, scan:$scan[0], analysis:$analysis, autofix:$fix, pending:$pend}')
+
+printf '%s' "$REPORT" > "$HW_LIB/reports/$TSFILE-$KIND.json"
+chmod 644 "$HW_LIB/reports/$TSFILE-$KIND.json"
+ls -1t "$HW_LIB/reports"/*.json 2>/dev/null | tail -n +80 | xargs -r rm -f
+
+if [ "$KIND" = manual ] && [ -n "$REQID" ]; then
+  printf '%s' "$REPORT" > "$HW_LIB/replies/$REQID.json"
+  chmod 644 "$HW_LIB/replies/$REQID.json"
+  find "$HW_LIB/replies" -type f -mmin +120 -delete 2>/dev/null
+else
+  printf '%s' "$REPORT" > "$HW_LIB/outbox/$TSFILE-$KIND.json"
+  chmod 644 "$HW_LIB/outbox/$TSFILE-$KIND.json"
+fi
+
+# --- Webhook ----------------------------------------------------------------
+# always:   post every report, no bot needed.
+# fallback: post only if something left a report sitting in the outbox, which
+#           means whatever was supposed to publish it is down.
+post_webhook() {
+  local file=$1 url body text
+  url=$(head -1 "$HW_WEBHOOK_FILE" 2>/dev/null)
+  [ -n "$url" ] || return 1
+  text=$(jq -r '
+    "**hostwatch \(.scan.host)** - verdict: \(.analysis.verdict)",
+    .analysis.summary, "",
+    ([.scan.findings[] | select(.level=="crit") | "[CRIT] \(.title)"] | join("\n")),
+    ([.scan.findings[] | select(.level=="warn") | "[WARN] \(.title)"] | join("\n")),
+    ([.autofix.done[]? | select(.ok) | "[FIXED] \(.label)"] | join("\n")),
+    ([.pending[]? | select(.status=="waiting") | "[NEEDS APPROVAL] \(.label)"] | join("\n"))
+  ' "$file" 2>/dev/null | grep -v '^$' | head -c 1800)
+  case "$url" in
+    *hooks.slack.com*) body=$(jq -Rn --arg t "$text" '{text:$t}');;
+    *)                 body=$(jq -Rn --arg t "$text" '{content:$t}');;
+  esac
+  curl -sS --max-time 12 -H 'Content-Type: application/json' -d "$body" "$url" >/dev/null 2>&1
+}
+
+if [ -s "$HW_WEBHOOK_FILE" ] && [ "$HW_WEBHOOK_MODE" != never ]; then
+  case "$HW_WEBHOOK_MODE" in
+    always)
+      f=$HW_LIB/outbox/$TSFILE-$KIND.json
+      [ -f "$f" ] && post_webhook "$f" && rm -f "$f";;
+    fallback)
+      if [ "$CRIT" -gt 0 ]; then
+        stale=$(find "$HW_LIB/outbox" -name '*.json' -mmin +15 2>/dev/null | head -1)
+        [ -n "$stale" ] && post_webhook "$stale" && rm -f "$stale"
+      fi;;
+  esac
+fi
+
+[ "$CRIT" -gt 0 ] && exit 2
+[ "$WARN" -gt 0 ] && exit 1
+exit 0

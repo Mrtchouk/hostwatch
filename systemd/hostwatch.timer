@@ -1,0 +1,12 @@
+[Unit]
+Description=hostwatch full report, five times a day
+
+[Timer]
+OnCalendar=*-*-* 02,07,12,17,22:00:00
+Persistent=true
+RandomizedDelaySec=120
+AccuracySec=30s
+Unit=hostwatch.service
+
+[Install]
+WantedBy=timers.target

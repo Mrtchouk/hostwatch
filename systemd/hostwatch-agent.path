@@ -1,0 +1,9 @@
+[Unit]
+Description=hostwatch request spool watcher
+
+[Path]
+PathExistsGlob=/var/spool/hostwatch/requests/*.json
+Unit=hostwatch-agent.service
+
+[Install]
+WantedBy=paths.target

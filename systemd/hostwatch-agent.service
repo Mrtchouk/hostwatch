@@ -1,0 +1,8 @@
+[Unit]
+Description=hostwatch request handler
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hostwatch/bin/hostwatch-agent
+TimeoutStartSec=900
+SuccessExitStatus=0 1 2

@@ -1,0 +1,12 @@
+[Unit]
+Description=hostwatch intrusion pass, alerts only on new findings
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hostwatch/bin/hostwatch-pending due
+ExecStart=/opt/hostwatch/bin/hostwatch-report --kind alert
+TimeoutStartSec=420
+Nice=15
+IOSchedulingClass=idle
+SuccessExitStatus=0 1 2

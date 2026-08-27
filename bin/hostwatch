@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# hostwatch — terminal front end.
+#
+#   hostwatch                last verdict, instantly
+#   hostwatch now            full scan and analysis now, also published
+#   hostwatch scan           raw scan, no analysis
+#   hostwatch log [n]        recent log lines
+#   hostwatch status         timers, queue, request spool
+#   hostwatch pending        actions waiting for a decision
+#   hostwatch approve <id> [now|refuse|<epoch>]
+#   hostwatch fix <key>      run one allowlisted action
+#   hostwatch fix --list     available actions
+#   hostwatch baseline       reset references to the current state
+set -uo pipefail
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${HW_LIB:=/var/lib/hostwatch}"
+: "${HW_LOG:=/var/log/hostwatch.log}"
+: "${HW_SPOOL:=/var/spool/hostwatch/requests}"
+
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+if [ -t 1 ]; then
+  R=$'\e[31m' O=$'\e[33m' G=$'\e[32m' B=$'\e[1m' D=$'\e[2m' N=$'\e[0m'
+else
+  R='' O='' G='' B='' D='' N=''
+fi
+
+show() {
+  jq -r --arg R "$R" --arg O "$O" --arg G "$G" --arg B "$B" --arg D "$D" --arg N "$N" '
+    "\($B)\(.scan.host // "host") - \(.ts) - \((.analysis.verdict // "?")|ascii_upcase)\($N)",
+    (.analysis.summary // ""), "",
+    (.scan.findings[]? | select(.level=="crit") | "\($R)CRIT\($N) \(.title)\n     \($D)\(.detail|gsub("\n";"\n     "))\($N)"),
+    (.scan.findings[]? | select(.level=="warn") | "\($O)WARN\($N) \(.title)"),
+    (if ((.scan.counts.crit // 0) + (.scan.counts.warn // 0)) == 0 then "\($G)clean\($N)" else empty end),
+    (if (.autofix.done // []) | length > 0 then "", "\($B)Fixed automatically\($N)" else empty end),
+    (.autofix.done[]? | select(.ok) | "  \($G)+\($N) \(.label)"),
+    (if (.pending // []) | map(select(.status=="waiting")) | length > 0 then "", "\($B)Waiting for your decision\($N)" else empty end),
+    (.pending[]? | select(.status=="waiting") | "  \($O)?\($N) \(.label) \($D)(hostwatch approve \(.id))\($N)\n     \($D)\(.why)\($N)"),
+    (.pending[]? | select(.status=="scheduled") | "  \($D)scheduled\($N) \(.label)"),
+    (if (.analysis.analysis // "") != "" then "", "\($B)Analysis\($N)", .analysis.analysis else empty end),
+    (if (.analysis.priorities // []) | length > 0 then "", "\($B)Priorities\($N)" else empty end),
+    (.analysis.priorities[]? | "  \($B)\(.title)\($N)\n     \(.why)" + (if (.command // "") != "" then "\n     $ \(.command)" else "" end)),
+    (if (.analysis.noise // []) | length > 0 then "", "\($D)Ignored: \((.analysis.noise|join("; ")))\($N)" else empty end)
+  ' "$1"
+}
+
+latest() { ls -1t "$HW_LIB/reports"/*.json 2>/dev/null | head -1; }
+
+case "${1:-}" in
+  now)
+    echo "Scanning..."
+    "$BIN/hostwatch-report" --kind periodic >/dev/null 2>&1
+    f=$(latest); [ -n "$f" ] && show "$f";;
+
+  scan)
+    "$BIN/hostwatch-scan" --mode full --json | jq -r '
+      "= crit \(.counts.crit)  warn \(.counts.warn)  info \(.counts.info)  (\(.duration_s)s)",
+      (.findings[] | "\(.level)\t\(.code)\t\(.title)")' \
+      | awk -F'\t' '{ if (NF<3) print; else printf "%-5s %-22s %s\n", $1, $2, $3 }';;
+
+  log) tail -n "${2:-60}" "$HW_LOG";;
+
+  status)
+    systemctl list-timers --all --no-pager 'hostwatch*' 2>/dev/null | head -n -2 || echo "no timers"
+    echo
+    systemctl is-active hostwatch-agent.path >/dev/null 2>&1 &&
+      echo "request agent : active" || echo "request agent : inactive"
+    echo "queued requests : $(ls -1 "$HW_SPOOL"/*.json 2>/dev/null | wc -l)"
+    echo "stored reports  : $(ls -1 "$HW_LIB/reports"/*.json 2>/dev/null | wc -l)"
+    echo "unpublished     : $(ls -1 "$HW_LIB/outbox"/*.json 2>/dev/null | wc -l)";;
+
+  pending)
+    "$BIN/hostwatch-pending" list \
+      | jq -r '.[] | "\(.id)\t\(.status)\t\(.label)"' \
+      | awk -F'\t' '{ printf "%-18s %-10s %s\n", $1, $2, $3 }';;
+
+  approve)
+    id=${2:-}; when=${3:-now}
+    [ -n "$id" ] || { echo "usage: hostwatch approve <id> [now|refuse|<epoch>]" >&2; exit 2; }
+    case "$when" in
+      now)    "$BIN/hostwatch-pending" run "$id" "$(id -un)";;
+      refuse) "$BIN/hostwatch-pending" refuse "$id" "$(id -un)";;
+      *)      "$BIN/hostwatch-pending" schedule "$id" "$when" "$(id -un)";;
+    esac;;
+
+  fix) shift; "$BIN/hostwatch-fix" "$@";;
+
+  baseline)
+    "$BIN/hostwatch-scan" --mode full --baseline-reset --quiet >/dev/null 2>&1
+    echo "References reset to the current state.";;
+
+  ""|last)
+    f=$(latest)
+    [ -n "$f" ] && show "$f" || echo "No report yet. Run: hostwatch now";;
+
+  *) sed -n '2,15p' "$0" | sed 's/^# \?//';;
+esac

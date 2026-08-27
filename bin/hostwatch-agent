@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# hostwatch-agent — serves requests dropped by an unprivileged consumer.
+#
+# A chat bot, a web UI, anything running as a normal user writes a request:
+#   $HW_SPOOL/<id>.json   {"id":"...","user":"...","kind":"manual"}
+#                         {"id":"...","user":"...","kind":"approve",
+#                          "pending":"<queued-action-id>","when":"now|refuse|<epoch>"}
+# A systemd path unit notices the file and runs this script as root. The answer
+# lands in $HW_LIB/replies/<id>.json.
+#
+# The requester never names a command, only an action already queued by the
+# scan. Compromising it does not yield root. Every field is filtered character
+# by character before use.
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.local/bin
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${HW_LIB:=/var/lib/hostwatch}"
+: "${HW_SPOOL:=/var/spool/hostwatch/requests}"
+: "${HW_AGENT_RATE:=6}"          # requests per 10 minutes
+
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+RATE=$HW_LIB/state/agent-rate.tsv
+mkdir -p "$HW_SPOOL" "$HW_LIB/state" "$HW_LIB/replies"
+touch "$RATE"
+
+NOW=$(date +%s)
+awk -v n="$NOW" '($1+600)>n' "$RATE" > "$RATE.tmp" 2>/dev/null && mv "$RATE.tmp" "$RATE"
+
+shopt -s nullglob
+for f in "$HW_SPOOL"/*.json; do
+  ID=$(jq -r '.id      // empty' "$f" 2>/dev/null | tr -cd 'A-Za-z0-9-'     | head -c 40)
+  USER=$(jq -r '.user  // empty' "$f" 2>/dev/null | tr -cd 'A-Za-z0-9_.-'   | head -c 40)
+  KIND=$(jq -r '.kind  // "manual"' "$f" 2>/dev/null | tr -cd 'a-z'         | head -c 12)
+  PID=$(jq -r '.pending // empty' "$f" 2>/dev/null | tr -cd 'A-Za-z0-9-'    | head -c 40)
+  WHEN=$(jq -r '.when  // empty' "$f" 2>/dev/null | tr -cd '0-9a-z'         | head -c 20)
+  rm -f "$f"
+  [ -n "$ID" ] || continue
+
+  if [ "$KIND" = approve ]; then
+    [ -n "$PID" ] || continue
+    case "$WHEN" in
+      now|"") "$BIN/hostwatch-pending" run "$PID" "$USER" >/dev/null 2>&1;;
+      refuse) "$BIN/hostwatch-pending" refuse "$PID" "$USER" >/dev/null 2>&1;;
+      *)      "$BIN/hostwatch-pending" schedule "$PID" "$WHEN" "$USER" >/dev/null 2>&1;;
+    esac
+    continue
+  fi
+
+  if [ "$(wc -l < "$RATE")" -ge "$HW_AGENT_RATE" ]; then
+    jq -nc --arg id "$ID" --argjson n "$HW_AGENT_RATE" \
+      '{id:$id,kind:"manual",request_id:$id,error:"rate_limit",
+        analysis:{verdict:"watch",summary:"Too many scans requested (\($n) per 10 minutes). Try again shortly.",
+                  analysis:"",priorities:[],noise:[],source:"none"},
+        scan:{counts:{crit:0,warn:0,info:0},findings:[],metrics:{}}}' > "$HW_LIB/replies/$ID.json"
+    chmod 644 "$HW_LIB/replies/$ID.json"
+    continue
+  fi
+  printf '%s\t%s\n' "$NOW" "$ID" >> "$RATE"
+
+  "$BIN/hostwatch-report" --kind manual --id "$ID" ${USER:+--user "$USER"} >/dev/null 2>&1
+done

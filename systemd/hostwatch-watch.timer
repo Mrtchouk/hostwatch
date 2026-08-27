@@ -1,0 +1,11 @@
+[Unit]
+Description=hostwatch intrusion pass, every five minutes
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+Unit=hostwatch-watch.service
+
+[Install]
+WantedBy=timers.target

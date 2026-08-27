@@ -1,0 +1,13 @@
+[Unit]
+Description=hostwatch full report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/hostwatch/bin/hostwatch-report --kind periodic
+TimeoutStartSec=900
+Nice=10
+IOSchedulingClass=idle
+# 1 (warnings) and 2 (critical) are results, not failures.
+SuccessExitStatus=0 1 2
