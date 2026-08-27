@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# hostwatch-autofix — applies what interrupts nothing, queues what does.
+#
+#   hostwatch-autofix [scan.json]   -> {"done":[...],"pending":[...]} on stdout
+#
+# Everything goes through hostwatch-fix, so the allowlist holds here too.
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${HW_LIB:=/var/lib/hostwatch}"
+: "${HW_AUTOFIX:=1}"
+: "${HW_SERVICE_PKGS:=^(mariadb|mysql|nginx|apache2|docker|containerd|redis|php[0-9.]*-fpm)}"
+
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+FIX=$BIN/hostwatch-fix
+SCAN=${1:-$HW_LIB/scans/last.json}
+PENDING=$HW_LIB/pending
+mkdir -p "$PENDING"; chmod 755 "$PENDING"
+
+[ "$HW_AUTOFIX" = 1 ] && [ -s "$SCAN" ] || { echo '{"done":[],"pending":[]}'; exit 0; }
+
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+DONE=$WORK/done.ndjson; PEND=$WORK/pending.ndjson
+: > "$DONE"; : > "$PEND"
+
+has_code() { jq -e --arg c "$1" '.findings[]? | select(.code==$c)' "$SCAN" >/dev/null 2>&1; }
+
+run_safe() {
+  local action=$1 label=$2 out rc
+  out=$("$FIX" "$action" 2>&1); rc=$?
+  jq -nc --arg a "$action" --arg l "$label" --arg o "$(printf '%s' "$out" | tail -3)" \
+     --argjson ok "$([ $rc -eq 0 ] && echo true || echo false)" \
+     '{action:$a,label:$l,result:$o,ok:$ok}' >> "$DONE"
+}
+
+# One queued entry per action key. Re-asking the same question every cycle is
+# how a notification channel becomes unreadable.
+queue() {
+  local action=$1 label=$2 why=$3 f id
+  for f in "$PENDING"/*.json; do
+    [ -f "$f" ] || continue
+    [ "$(jq -r '.action' "$f" 2>/dev/null)" = "$action" ] || continue
+    case "$(jq -r '.status' "$f" 2>/dev/null)" in waiting|scheduled) return 0;; esac
+  done
+  id="p$(date +%s)-$RANDOM"
+  jq -nc --arg id "$id" --arg a "$action" --arg l "$label" --arg w "$why" --arg t "$(date '+%F %T')" \
+    '{id:$id,action:$a,label:$l,why:$w,status:"waiting",created:$t,run_at:null,requested_by:null}' \
+    > "$PENDING/$id.json"
+  chmod 644 "$PENDING/$id.json"
+  cat "$PENDING/$id.json" >> "$PEND"
+}
+
+has_code secret.worldread && run_safe perm_env      "Secret file permissions tightened to 640"
+has_code db.noblock       && run_safe db_block      "External database port blocked again"
+has_code ssl.expired      && run_safe certbot_renew "Certificate renewal"
+has_code ssl.soon         && run_safe certbot_renew "Certificate renewal"
+
+# Restarting something already stopped interrupts nothing.
+for svc in $(jq -r '.findings[]? | select(.code=="service.down") | .detail' "$SCAN" 2>/dev/null); do
+  run_safe "svc_start:$svc" "Service $svc started (it was down)"
+done
+for app in $(jq -r '.findings[]? | select(.code=="service.pm2") | .detail' "$SCAN" 2>/dev/null); do
+  run_safe "pm2_restart:$app" "PM2 process $app restarted (offline)"
+done
+
+if has_code apt.security; then
+  run_safe apt_security_safe "Security patches applied, service packages excluded"
+  rest=$(apt-get -s upgrade 2>/dev/null | awk '/^Inst /{print $2}' | grep -iE "$HW_SERVICE_PKGS" | paste -sd' ')
+  [ -n "${rest:-}" ] && queue apt_upgrade_all "Upgrade service packages: $rest" \
+    "Installing these restarts the web server, database or container runtime. Everything they serve is down for the duration."
+fi
+
+has_code kernel.reboot && queue reboot "Reboot the host (kernel and libraries patched)" \
+  "Patched kernels only take effect after a restart. Every service on this host stops for roughly two minutes."
+
+jq -n --slurpfile d <(jq -s . "$DONE" 2>/dev/null || echo '[]') \
+      --slurpfile p <(jq -s . "$PEND" 2>/dev/null || echo '[]') \
+      '{done:($d[0] // []), pending:($p[0] // [])}'

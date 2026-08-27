@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# hostwatch-pending — runs the queued actions a human approved.
+#
+#   hostwatch-pending run <id> [who]
+#   hostwatch-pending schedule <id> <epoch> [who]
+#   hostwatch-pending refuse <id> [who]
+#   hostwatch-pending due                      run whatever is now due
+#   hostwatch-pending list                     queue as JSON
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${HW_LIB:=/var/lib/hostwatch}"
+
+BIN=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+FIX=$BIN/hostwatch-fix
+PENDING=$HW_LIB/pending
+OUTBOX=$HW_LIB/outbox
+mkdir -p "$PENDING" "$OUTBOX"
+
+announce() {  # <pending-id> <label> <status> <result> [who]
+  local id=$1 label=$2 status=$3 result=$4 who=${5:-} ts
+  ts=$(date '+%Y%m%d-%H%M%S')
+  jq -nc --arg id "fix-$ts" --arg ts "$(date '+%F %T')" --arg l "$label" \
+         --arg s "$status" --arg r "$result" --arg u "$who" --arg pid "$id" \
+    '{id:$id, kind:"fix", ts:$ts, requester:(if $u=="" then null else $u end),
+      fix:{pending_id:$pid, label:$l, status:$s, result:$r}}' > "$OUTBOX/$ts-fix.json"
+  chmod 644 "$OUTBOX/$ts-fix.json"
+}
+
+set_field() {  # <file> <key> <json-value>
+  local f=$1 k=$2 v=$3 tmp; tmp=$(mktemp)
+  jq --arg k "$k" --argjson v "$v" '.[$k]=$v' "$f" > "$tmp" && mv "$tmp" "$f" && chmod 644 "$f"
+}
+
+execute() {
+  local f=$1 id label action who out rc
+  id=$(jq -r '.id' "$f"); label=$(jq -r '.label' "$f")
+  action=$(jq -r '.action' "$f"); who=$(jq -r '.requested_by // ""' "$f")
+
+  # A reboot kills the notifier along with everything else, so the notice goes
+  # out first and gets a moment to be delivered.
+  if [ "$action" = reboot ]; then
+    announce "$id" "$label" starting "Rebooting in one minute. Every service on this host goes down for about two minutes." "$who"
+    sleep 25
+  fi
+
+  out=$("$FIX" "$action" 2>&1); rc=$?
+  set_field "$f" status "$([ $rc -eq 0 ] && echo '"done"' || echo '"failed"')"
+  set_field "$f" result "$(jq -Rn --arg o "$(printf '%s' "$out" | tail -3)" '$o')"
+  set_field "$f" executed_at "$(jq -Rn --arg t "$(date '+%F %T')" '$t')"
+  [ "$action" = reboot ] ||
+    announce "$id" "$label" "$([ $rc -eq 0 ] && echo "done" || echo "failed")" "$(printf '%s' "$out" | tail -3)" "$who"
+}
+
+id_of() { printf '%s' "${1:-}" | tr -cd 'A-Za-z0-9-'; }
+
+case "${1:-}" in
+  run)
+    f=$PENDING/$(id_of "${2:-}").json
+    [ -f "$f" ] || { echo "unknown action" >&2; exit 2; }
+    [ "$(jq -r '.status' "$f")" = "done" ] && { echo "already executed"; exit 0; }
+    [ -n "${3:-}" ] && set_field "$f" requested_by "$(jq -Rn --arg u "$3" '$u')"
+    execute "$f";;
+
+  schedule)
+    f=$PENDING/$(id_of "${2:-}").json
+    at=$(printf '%s' "${3:-}" | tr -cd '0-9')
+    [ -f "$f" ] && [ -n "$at" ] || { echo "bad arguments" >&2; exit 2; }
+    set_field "$f" run_at "$at"; set_field "$f" status '"scheduled"'
+    [ -n "${4:-}" ] && set_field "$f" requested_by "$(jq -Rn --arg u "$4" '$u')"
+    announce "$(jq -r '.id' "$f")" "$(jq -r '.label' "$f")" scheduled \
+      "Scheduled for $(date -d "@$at" '+%F %H:%M')." "${4:-}";;
+
+  refuse)
+    f=$PENDING/$(id_of "${2:-}").json
+    [ -f "$f" ] || exit 2
+    set_field "$f" status '"refused"'
+    announce "$(jq -r '.id' "$f")" "$(jq -r '.label' "$f")" refused \
+      "Dismissed. It will be raised again if the situation changes." "${3:-}";;
+
+  due)
+    now=$(date +%s)
+    for f in "$PENDING"/*.json; do
+      [ -f "$f" ] || continue
+      [ "$(jq -r '.status' "$f")" = "scheduled" ] || continue
+      at=$(jq -r '.run_at // 0' "$f")
+      [ "$at" -le "$now" ] 2>/dev/null && execute "$f"
+    done
+    find "$PENDING" -name '*.json' -mtime +7 2>/dev/null | while read -r old; do
+      case "$(jq -r '.status' "$old" 2>/dev/null)" in done|refused|failed) rm -f "$old";; esac
+    done;;
+
+  list)
+    jq -s '.' "$PENDING"/*.json 2>/dev/null || echo '[]';;
+
+  *) sed -n '2,10p' "$0" | sed 's/^# \?//'; exit 2;;
+esac

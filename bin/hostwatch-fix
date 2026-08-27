@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# hostwatch-fix — remediation executor. Strict allowlist.
+#
+#   hostwatch-fix <action-key>
+#   hostwatch-fix --list
+#   hostwatch-fix --is-disruptive <action-key>    exit 0 if it interrupts service
+#
+# An action key is a fixed identifier, never a command. Nothing downstream --
+# not the analysis layer, not a chat bot, not an operator typing into a form --
+# can make this script run anything that is not written below. That property is
+# what makes it acceptable for an unprivileged process to trigger root-level
+# remediation at all.
+#
+# Two families: actions that interrupt nothing, applied automatically; actions
+# that take a service down, never run without an explicit human decision.
+set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=l          # list services needing restart, restart none
+
+CONF=${HW_CONF:-/etc/hostwatch/hostwatch.conf}
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${HW_LIB:=/var/lib/hostwatch}"
+: "${HW_MYSQL_PORT:=3306}"
+: "${HW_SERVICE_PKGS:=^(mariadb|mysql|nginx|apache2|docker|containerd|redis|php[0-9.]*-fpm)}"
+HW_SECRET_FILES=("${HW_SECRET_FILES[@]-}")
+HW_FIX_SERVICES=("${HW_FIX_SERVICES[@]-}")
+HW_FIX_PM2_APPS=("${HW_FIX_PM2_APPS[@]-}")
+: "${HW_PM2_USER:=}"
+
+LOG=$HW_LIB/fix.log
+mkdir -p "$HW_LIB"
+
+allowed() {  # allowed <needle> <haystack...>
+  local n=$1; shift
+  local x; for x in "$@"; do [ "$x" = "$n" ] && return 0; done
+  return 1
+}
+
+is_disruptive() {
+  case "$1" in
+    reboot|apt_upgrade_all|svc_restart:*) return 0;;
+    *) return 1;;
+  esac
+}
+
+case "${1:-}" in
+  --list)
+    cat <<'EOF'
+perm_env             chmod 640 on world-readable secret files        [safe]
+apt_security_safe    security patches, excluding service packages    [safe]
+db_block             re-add the external DROP rule on the DB port    [safe]
+certbot_renew        renew certificates close to expiry              [safe]
+svc_start:<name>     start a critical service that is stopped        [safe]
+pm2_restart:<name>   restart an offline PM2 process                  [safe]
+apt_upgrade_all      full upgrade, service packages included         [INTERRUPTS]
+svc_restart:<name>   restart a running service                       [INTERRUPTS]
+reboot               reboot the host                                 [INTERRUPTS]
+EOF
+    exit 0;;
+  --is-disruptive) is_disruptive "${2:-}" && exit 0 || exit 1;;
+esac
+
+ACTION=${1:-}
+[ -n "$ACTION" ] || { echo "missing action" >&2; exit 2; }
+
+case "$ACTION" in
+
+  perm_env)
+    changed=0
+    for f in "${HW_SECRET_FILES[@]}"; do
+      [ -n "$f" ] && [ -f "$f" ] || continue
+      p=$(stat -c '%a' "$f"); [ $(( ${p: -1} & 4 )) -ne 0 ] || continue
+      chmod 640 "$f" && { echo "chmod 640 $f (was $p)"; changed=1; }
+    done
+    [ "$changed" = 1 ] || echo "no world-readable secret file"
+    ;;
+
+  apt_security_safe)
+    apt-get update -qq >/dev/null 2>&1
+    pkgs=$(apt-get -s upgrade 2>/dev/null | awk '/^Inst /{print $2}' | grep -viE "$HW_SERVICE_PKGS" | tr '\n' ' ')
+    [ -n "${pkgs// /}" ] || { echo "nothing to upgrade outside service packages"; exit 0; }
+    out=$(apt-get install -y --only-upgrade $pkgs 2>&1 | tail -5)
+    echo "upgraded: $pkgs"
+    printf '%s\n' "$out" | grep -qiE "^E:" && { echo "apt error"; exit 1; }
+    ;;
+
+  db_block)
+    iptables -S 2>/dev/null | grep -qE "dport $HW_MYSQL_PORT -j DROP" && { echo "rule already present"; exit 0; }
+    iptables -I INPUT -p tcp --dport "$HW_MYSQL_PORT" ! -s 127.0.0.1 -j DROP &&
+      echo "external DROP on port $HW_MYSQL_PORT restored"
+    ;;
+
+  certbot_renew)
+    command -v certbot >/dev/null || { echo "certbot not installed"; exit 1; }
+    out=$(certbot renew --quiet --no-random-sleep-on-renew 2>&1 | tail -5)
+    echo "certbot renew: ${out:-nothing due}"
+    ;;
+
+  svc_start:*)
+    svc=${ACTION#svc_start:}
+    allowed "$svc" "${HW_FIX_SERVICES[@]}" || { echo "service not allowlisted: $svc" >&2; exit 2; }
+    systemctl is-active --quiet "$svc" && { echo "$svc already active"; exit 0; }
+    systemctl start "$svc" && echo "$svc started"
+    ;;
+
+  pm2_restart:*)
+    app=${ACTION#pm2_restart:}
+    [ -n "$HW_PM2_USER" ] || { echo "no PM2 user configured" >&2; exit 2; }
+    allowed "$app" "${HW_FIX_PM2_APPS[@]}" || { echo "app not allowlisted: $app" >&2; exit 2; }
+    sudo -u "$HW_PM2_USER" -H pm2 restart "$app" >/dev/null 2>&1 && echo "$app restarted"
+    ;;
+
+  apt_upgrade_all)
+    apt-get update -qq >/dev/null 2>&1
+    apt-get upgrade -y >/dev/null 2>&1
+    need=$(command -v needrestart >/dev/null && needrestart -b 2>/dev/null | awk -F: '/NEEDRESTART-SVC/{print $2}' | paste -sd' ')
+    echo "full upgrade done. services needing restart: ${need:-none}"
+    ;;
+
+  svc_restart:*)
+    svc=${ACTION#svc_restart:}
+    allowed "$svc" "${HW_FIX_SERVICES[@]}" || { echo "service not allowlisted: $svc" >&2; exit 2; }
+    systemctl restart "$svc" && echo "$svc restarted"
+    ;;
+
+  reboot)
+    # One minute of grace so the pending notice reaches its channel first.
+    shutdown -r +1 "hostwatch: security reboot" >/dev/null 2>&1
+    echo "reboot scheduled in 1 minute"
+    ;;
+
+  *) echo "unknown action: $ACTION" >&2; exit 2;;
+esac
+
+printf '[%s] %s\n' "$(date '+%F %T')" "$ACTION" >> "$LOG"
